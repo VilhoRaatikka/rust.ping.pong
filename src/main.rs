@@ -6,21 +6,31 @@ use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use chrono::prelude::*;
 use tokio::sync::RwLock;
+use tokio::time::{sleep, Duration, Instant};
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug)]
 enum MsgType {
     Hello,
     Normal,
     ServerList,
+    Ping,
+    PingResponse,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Message {
     msg_type: MsgType,
     serial_number: Option<u32>,
-    timestamp: String, // ISO 8601
+    timestamp: String,
     content: Option<String>,
     servers: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ContentData {
+    key: String,
+    value: String,
 }
 
 #[tokio::main]
@@ -76,31 +86,63 @@ async fn main() {
     // 6. Lähetys-tehtävä: vastaanottaa käyttäjän syötteen ja lähettää viestejä
     let send_task = tokio::spawn(async move {
         let mut serial_number = 1;
+        let mut last_send_times: HashMap<String, Instant> = HashMap::new();
 
-        while let Some(msg) = rx.recv().await {
-            let message = Message {
-                msg_type: MsgType::Normal,
-                serial_number: Some(serial_number),
-                timestamp: Utc::now().to_rfc3339(),
-                content: Some(msg.clone()),
-                servers: None,
-            };
+        loop {
+            tokio::select! {
+                Some(msg) = rx.recv() => {
+                    let message = Message {
+                        msg_type: MsgType::Normal,
+                        serial_number: Some(serial_number),
+                        timestamp: Utc::now().to_rfc3339(),
+                        content: Some(msg.clone()),
+                        servers: None,
+                    };
 
-            let serialized = serde_json::to_string(&message).expect("Failed to serialize message");
+                    let serialized = serde_json::to_string(&message).expect("Failed to serialize message");
+                    let servers = known_servers_send.read().await.clone();
+                    
+                    for server in &servers {
+                        if server != &*own_address_send {
+                            if let Err(e) = send_socket.send_to(serialized.as_bytes(), &server).await {
+                                eprintln!("Failed to send message to {}: {}", server, e);
+                            } else {
+                                println!("Sent message {}: {}", serial_number, msg);
+                                last_send_times.insert(server.clone(), Instant::now());
+                            }
+                        }
+                    }
 
-            // Lähetetään viesti kaikille tunnetuille palvelimille
-            let servers = known_servers_send.read().await.clone();
-            for server in &servers { // Iteroidaan viitteiden kautta
-                if server != &*own_address_send { // Vertaillaan viitteitä
-                    if let Err(e) = send_socket.send_to(serialized.as_bytes(), &server).await {
-                        eprintln!("Failed to send message to {}: {}", server, e);
-                    } else {
-                        println!("Sent message {}: {}", serial_number, msg);
+                    serial_number += 1;
+                }
+                _ = sleep(Duration::from_millis(100)) => {
+                    let servers = known_servers_send.read().await.clone();
+                    let now = Instant::now();
+                    
+                    for server in &servers {
+                        if server != &*own_address_send {
+                            let last_send = last_send_times.get(server).copied().unwrap_or(Instant::now() - Duration::from_secs(2));
+                            
+                            if now.duration_since(last_send) >= Duration::from_secs(1) {
+                                let ping_message = Message {
+                                    msg_type: MsgType::Ping,
+                                    serial_number: None,
+                                    timestamp: Utc::now().to_rfc3339(),
+                                    content: None,
+                                    servers: None,
+                                };
+                                
+                                let serialized = serde_json::to_string(&ping_message).expect("Failed to serialize ping message");
+                                if let Err(e) = send_socket.send_to(serialized.as_bytes(), &server).await {
+                                    eprintln!("Failed to send ping to {}: {}", server, e);
+                                } else {
+                                    last_send_times.insert(server.clone(), now);
+                                }
+                            }
+                        }
                     }
                 }
             }
-
-            serial_number += 1;
         }
     });
 
@@ -110,18 +152,43 @@ async fn main() {
     let stdin_task = tokio::spawn(async move {
         let stdin = tokio::io::stdin();
         let mut stdin_lines = BufReader::new(stdin).lines();
+        let mut serial_number = 1;
 
         while let Ok(Some(line)) = stdin_lines.next_line().await {
-            let msg = line.trim().to_string();
-            if !msg.is_empty() {
-                if let Err(e) = tx_clone.send(msg).await {
-                    eprintln!("Failed to send message to channel: {}", e);
-                    break;
+            let input = line.trim();
+            
+            if let Some((key, value)) = input.split_once('=') {
+                let key = key.trim();
+                let value = value.trim();
+                
+                if !key.is_empty() && !value.is_empty() {
+                    // Luodaan JSON-objekti key-value -parista
+                    let content = serde_json::json!({
+                        "key": key,
+                        "value": value
+                    }).to_string();
+
+                    let message = Message {
+                        msg_type: MsgType::Normal,
+                        serial_number: Some(serial_number),
+                        timestamp: Utc::now().to_rfc3339(),
+                        content: Some(content),
+                        servers: None,
+                    };
+
+                    if let Err(e) = tx_clone.send(serde_json::to_string(&message).expect("Failed to serialize message")).await {
+                        eprintln!("Failed to send message to channel: {}", e);
+                        break;
+                    }
+                    serial_number += 1;
+                } else {
+                    eprintln!("Invalid input format. Use: key=value");
                 }
+            } else {
+                eprintln!("Invalid input format. Use: key=value");
             }
         }
 
-        // Suljetaan lähetys-kanava, kun stdin päättyy
         drop(tx_clone);
     });
 
@@ -235,6 +302,28 @@ async fn main() {
                                             }
                                         }
                                     }
+                                },
+                                MsgType::Ping => {
+                                    // Vastataan ping-viestiin
+                                    let ping_response = Message {
+                                        msg_type: MsgType::PingResponse,
+                                        serial_number: None,
+                                        timestamp: Utc::now().to_rfc3339(),
+                                        content: None,
+                                        servers: None,
+                                    };
+                                    
+                                    let serialized = serde_json::to_string(&ping_response)
+                                        .expect("Failed to serialize ping response");
+                                        
+                                    if let Err(e) = recv_socket.send_to(serialized.as_bytes(), &src).await {
+                                        eprintln!("Failed to send ping response to {}: {}", src, e);
+                                    } else {
+                                        //println!("Received ping from {} and sent response", src);
+                                    }
+                                },
+                                MsgType::PingResponse => {
+                                    //println!("Received ping response from {}", src);
                                 },
                             }
                         },
